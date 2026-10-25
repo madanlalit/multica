@@ -132,6 +132,7 @@ allowlist의 정확한 판단 순서는 [로그인과 가입](/auth-setup#가입
 | `AWS_SECRET_ACCESS_KEY` | SDK 기본 자격 증명 chain | 정적 secret key |
 | `AWS_ENDPOINT_URL` | 비어 있음 | MinIO 같은 S3 호환 endpoint |
 | `S3_USE_PATH_STYLE` | 사용자 지정 endpoint에서는 `true` | path-style 주소 사용 여부 |
+| `S3_UNSIGNED_HEADERS` | 비어 있음 (Google Cloud Storage에서는 자동으로 `accept-encoding`) | SigV4 서명에서 제외할 쉼표로 구분된 헤더 목록 (GCS S3 XML API 호환을 위한 `accept-encoding` 등). 참고: 서명에서 제외된 헤더는 전송 중 SigV4 무결성 보호를 받지 않습니다. |
 | `ATTACHMENT_DOWNLOAD_MODE` | `auto` | `auto`, `cloudfront`, `presign`, `proxy` 중 하나 |
 | `ATTACHMENT_DOWNLOAD_URL_TTL` | `30m` | 서명된 다운로드 주소의 유효 기간 |
 

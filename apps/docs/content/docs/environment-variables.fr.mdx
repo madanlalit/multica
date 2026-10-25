@@ -132,6 +132,7 @@ Lorsque `S3_BUCKET` n'est pas défini, Multica utilise le disque local.
 | `AWS_SECRET_ACCESS_KEY` | chaîne d'identifiants par défaut du SDK | Clé secrète statique |
 | `AWS_ENDPOINT_URL` | vide | Point de terminaison compatible S3, comme MinIO |
 | `S3_USE_PATH_STYLE` | `true` avec un point de terminaison personnalisé | Utiliser ou non l'adressage de type chemin (path-style) |
+| `S3_UNSIGNED_HEADERS` | vide (auto : `accept-encoding` pour Google Cloud Storage) | Liste séparée par des virgules des en-têtes à omettre des signatures SigV4 (par ex. `accept-encoding` pour la compatibilité avec l'API XML S3 de GCS). Remarque : omettre des en-têtes supprime la protection d'intégrité SigV4 de ces en-têtes en transit. |
 | `ATTACHMENT_DOWNLOAD_MODE` | `auto` | `auto`, `cloudfront`, `presign` ou `proxy` |
 | `ATTACHMENT_DOWNLOAD_URL_TTL` | `30m` | Durée de vie des URL de téléchargement signées |
 

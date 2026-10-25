@@ -7,12 +7,16 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 func TestS3StorageUploadStreamUsesFixedLengthRequest(t *testing.T) {
@@ -609,5 +613,261 @@ func TestS3StorageUploadedURL(t *testing.T) {
 				t.Fatalf("uploadedURL() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestS3UnsignedHeadersFromEnv(t *testing.T) {
+	cases := []struct {
+		name        string
+		envVal      string
+		endpointURL string
+		want        []string
+	}{
+		{
+			name:        "unset with default AWS endpoint",
+			endpointURL: "",
+			want:        nil,
+		},
+		{
+			name:        "unset with Google Cloud Storage endpoint auto-defaults to accept-encoding",
+			endpointURL: "https://storage.googleapis.com",
+			want:        []string{"accept-encoding"},
+		},
+		{
+			name:        "unset with Google Cloud Storage bucket subdomain auto-defaults to accept-encoding",
+			endpointURL: "https://mybucket.storage.googleapis.com",
+			want:        []string{"accept-encoding"},
+		},
+		{
+			name:        "unset with non-GCS domain ending with storage.googleapis.com suffix does not match",
+			endpointURL: "https://storage.googleapis.com.attacker.example",
+			want:        nil,
+		},
+		{
+			name:        "explicit env var override with third-party endpoint",
+			envVal:      "x-custom-header",
+			endpointURL: "https://minio.local",
+			want:        []string{"x-custom-header"},
+		},
+		{
+			name:        "explicit env var merges with GCS default accept-encoding",
+			envVal:      "x-custom-header",
+			endpointURL: "https://storage.googleapis.com",
+			want:        []string{"x-custom-header", "accept-encoding"},
+		},
+		{
+			name:        "explicit env var already containing accept-encoding on GCS does not duplicate",
+			envVal:      " accept-encoding , x-custom-header ",
+			endpointURL: "https://storage.googleapis.com",
+			want:        []string{"accept-encoding", "x-custom-header"},
+		},
+		{
+			name:        "explicit env var with duplicate headers (case-insensitive) dedupes",
+			envVal:      "Accept-Encoding, accept-encoding, X-Custom, x-custom ",
+			endpointURL: "https://storage.googleapis.com",
+			want:        []string{"accept-encoding", "x-custom"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.envVal != "" {
+				t.Setenv("S3_UNSIGNED_HEADERS", tc.envVal)
+			} else {
+				t.Setenv("S3_UNSIGNED_HEADERS", "")
+			}
+			got := s3UnsignedHeadersFromEnv(tc.endpointURL)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestS3Storage_UnsignedHeadersOmittedFromSignature(t *testing.T) {
+	var observedAuth string
+	var observedAcceptEncoding string
+	var observedCustomHeader string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observedAuth = r.Header.Get("Authorization")
+		observedAcceptEncoding = r.Header.Get("Accept-Encoding")
+		observedCustomHeader = r.Header.Get("X-Custom-Header")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	addCustomHeaderOption := func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Build.Add(middleware.BuildMiddlewareFunc("AddCustomHeader",
+				func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+					if req, ok := in.Request.(*smithyhttp.Request); ok {
+						req.Header.Set("X-Custom-Header", "custom-header-value")
+					}
+					return next.HandleBuild(ctx, in)
+				},
+			), middleware.After)
+		})
+	}
+
+	client := s3.New(s3.Options{
+		Region:       "us-east-1",
+		Credentials:  aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("AKID", "SECRET", "")),
+		BaseEndpoint: aws.String(server.URL),
+		UsePathStyle: true,
+	}, withUnsignedHeaders("accept-encoding", "x-custom-header"), addCustomHeaderOption)
+
+	_, err := client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String("test-bucket"),
+		Key:    aws.String("test-key"),
+		Body:   strings.NewReader("sample payload"),
+	})
+	if err != nil {
+		t.Fatalf("PutObject failed: %v", err)
+	}
+
+	// SignedHeaders in Authorization header must NOT contain accept-encoding or x-custom-header
+	if strings.Contains(strings.ToLower(observedAuth), "accept-encoding") {
+		t.Errorf("expected SignedHeaders to NOT contain accept-encoding, but Authorization header was: %s", observedAuth)
+	}
+	if strings.Contains(strings.ToLower(observedAuth), "x-custom-header") {
+		t.Errorf("expected SignedHeaders to NOT contain x-custom-header, but Authorization header was: %s", observedAuth)
+	}
+
+	// Headers must still be transmitted on the wire
+	if observedAcceptEncoding != "identity" {
+		t.Errorf("expected Accept-Encoding header on wire to be identity, got: %s", observedAcceptEncoding)
+	}
+	if observedCustomHeader != "custom-header-value" {
+		t.Errorf("expected X-Custom-Header on wire to be custom-header-value, got: %s", observedCustomHeader)
+	}
+}
+
+func TestS3Storage_PresignWithUnsignedHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := s3.New(s3.Options{
+		Region:       "us-east-1",
+		Credentials:  aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("AKID", "SECRET", "")),
+		BaseEndpoint: aws.String(server.URL),
+		UsePathStyle: true,
+	}, withUnsignedHeaders("accept-encoding"))
+
+	presignClient := s3.NewPresignClient(client)
+	presigned, err := presignClient.PresignGetObject(context.Background(), &s3.GetObjectInput{
+		Bucket: aws.String("test-bucket"),
+		Key:    aws.String("test-key"),
+	})
+	if err != nil {
+		t.Fatalf("PresignGetObject with unsigned headers middleware failed: %v", err)
+	}
+	if presigned.URL == "" {
+		t.Fatalf("expected non-empty presigned URL")
+	}
+
+	u, err := url.Parse(presigned.URL)
+	if err != nil {
+		t.Fatalf("failed to parse presigned URL %q: %v", presigned.URL, err)
+	}
+	signedHeaders := u.Query().Get("X-Amz-SignedHeaders")
+	if signedHeaders == "" {
+		t.Fatalf("expected X-Amz-SignedHeaders query parameter in presigned URL: %s", presigned.URL)
+	}
+	if strings.Contains(strings.ToLower(signedHeaders), "accept-encoding") {
+		t.Errorf("expected X-Amz-SignedHeaders in presigned URL to NOT contain accept-encoding, got: %q", signedHeaders)
+	}
+}
+
+func TestS3Storage_RetryWithUnsignedHeaders(t *testing.T) {
+	type attemptData struct {
+		auth           string
+		acceptEncoding string
+		customHeader   string
+	}
+	var mu sync.Mutex
+	var attempts []attemptData
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts = append(attempts, attemptData{
+			auth:           r.Header.Get("Authorization"),
+			acceptEncoding: r.Header.Get("Accept-Encoding"),
+			customHeader:   r.Header.Get("X-Custom-Header"),
+		})
+		count := len(attempts)
+		mu.Unlock()
+
+		if count == 1 {
+			// Trigger a retryable server error on the first attempt
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	addCustomHeaderOption := func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Build.Add(middleware.BuildMiddlewareFunc("AddCustomHeader",
+				func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (middleware.BuildOutput, middleware.Metadata, error) {
+					if req, ok := in.Request.(*smithyhttp.Request); ok {
+						req.Header.Set("X-Custom-Header", "custom-header-value")
+					}
+					return next.HandleBuild(ctx, in)
+				},
+			), middleware.After)
+		})
+	}
+
+	retryer := retry.NewStandard(func(o *retry.StandardOptions) {
+		o.MaxAttempts = 3
+		o.MaxBackoff = 5 * time.Millisecond
+	})
+
+	client := s3.New(s3.Options{
+		Region:       "us-east-1",
+		Credentials:  aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("AKID", "SECRET", "")),
+		BaseEndpoint: aws.String(server.URL),
+		UsePathStyle: true,
+		Retryer:      retryer,
+	}, withUnsignedHeaders("accept-encoding", "x-custom-header"), addCustomHeaderOption)
+
+	_, err := client.PutObject(context.Background(), &s3.PutObjectInput{
+		Bucket: aws.String("test-bucket"),
+		Key:    aws.String("test-key"),
+		Body:   strings.NewReader("sample payload"),
+	})
+	if err != nil {
+		t.Fatalf("PutObject failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(attempts) != 2 {
+		t.Fatalf("expected 2 attempts, got %d", len(attempts))
+	}
+
+	for i, att := range attempts {
+		if strings.Contains(strings.ToLower(att.auth), "accept-encoding") {
+			t.Errorf("attempt %d: expected SignedHeaders to NOT contain accept-encoding, got: %s", i+1, att.auth)
+		}
+		if strings.Contains(strings.ToLower(att.auth), "x-custom-header") {
+			t.Errorf("attempt %d: expected SignedHeaders to NOT contain x-custom-header, got: %s", i+1, att.auth)
+		}
+		if att.acceptEncoding != "identity" {
+			t.Errorf("attempt %d: expected Accept-Encoding on wire to be identity, got: %s", i+1, att.acceptEncoding)
+		}
+		if att.customHeader != "custom-header-value" {
+			t.Errorf("attempt %d: expected X-Custom-Header on wire to be custom-header-value, got: %s", i+1, att.customHeader)
+		}
 	}
 }
