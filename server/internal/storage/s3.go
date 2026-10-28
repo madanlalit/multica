@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -80,7 +79,6 @@ func NewS3StorageFromEnv() *S3Storage {
 
 	endpointURL := os.Getenv("AWS_ENDPOINT_URL")
 	usePathStyle := s3UsePathStyleFromEnv(endpointURL)
-	unsignedHeaders := s3UnsignedHeadersFromEnv(endpointURL)
 	s3Opts := []func(*s3.Options){}
 	if endpointURL != "" || usePathStyle {
 		s3Opts = append(s3Opts, func(o *s3.Options) {
@@ -90,11 +88,13 @@ func NewS3StorageFromEnv() *S3Storage {
 			o.UsePathStyle = usePathStyle
 		})
 	}
-	if len(unsignedHeaders) > 0 {
-		s3Opts = append(s3Opts, withUnsignedHeaders(unsignedHeaders...))
+	if isGCSEndpoint(endpointURL) {
+		s3Opts = append(s3Opts, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, excludeGCSAcceptEncoding)
+		})
 	}
 
-	slog.Info("S3 storage initialized", "bucket", bucket, "region", region, "cdn_domain", cdnDomain, "endpoint_url", endpointURL, "use_path_style", usePathStyle, "unsigned_headers", unsignedHeaders)
+	slog.Info("S3 storage initialized", "bucket", bucket, "region", region, "cdn_domain", cdnDomain, "endpoint_url", endpointURL, "use_path_style", usePathStyle)
 	return &S3Storage{
 		client:       s3.NewFromConfig(cfg, s3Opts...),
 		bucket:       bucket,
@@ -152,140 +152,41 @@ func isGCSEndpoint(endpointURL string) bool {
 	return host == "storage.googleapis.com" || strings.HasSuffix(host, ".storage.googleapis.com")
 }
 
-// s3UnsignedHeadersFromEnv returns the list of headers to omit from SigV4 signatures.
-//
-// If AWS_ENDPOINT_URL points to Google Cloud Storage (storage.googleapis.com),
-// "accept-encoding" is automatically included because GCS rewrites Accept-Encoding to
-// identity,gzip(gfe) in transit, causing HTTP 403 SignatureDoesNotMatch (GH #9509).
-//
-// An explicit comma-separated S3_UNSIGNED_HEADERS environment variable provides
-// additional headers or overrides for other backends. When targeting GCS, "accept-encoding"
-// is always merged into the list to ensure GCS compatibility is preserved.
-// Duplicate header names are deduplicated case-insensitively.
-func s3UnsignedHeadersFromEnv(endpointURL string) []string {
-	var headers []string
-	seen := make(map[string]bool)
-
-	addHeader := func(name string) {
-		trimmed := strings.TrimSpace(name)
-		if trimmed == "" {
-			return
-		}
-		lower := strings.ToLower(trimmed)
-		if !seen[lower] {
-			seen[lower] = true
-			headers = append(headers, lower)
-		}
+// excludeGCSAcceptEncoding keeps the header GCS rewrites out of the signature,
+// while retaining the SDK's value on the wire to prevent automatic decompression.
+func excludeGCSAcceptEncoding(stack *middleware.Stack) error {
+	// Presigning replaces Signing and removes the SDK's Accept-Encoding middleware.
+	if _, ok := stack.Finalize.Get("Signing"); !ok {
+		return nil
 	}
 
-	if v := os.Getenv("S3_UNSIGNED_HEADERS"); v != "" {
-		for _, h := range strings.Split(v, ",") {
-			addHeader(h)
-		}
-	}
-	if isGCSEndpoint(endpointURL) {
-		addHeader("accept-encoding")
-	}
-	return headers
-}
-
-type unsignedHeadersContextKey struct{}
-
-type capturedHeaderEntry struct {
-	name   string
-	values []string
-}
-
-type s3HTTPClientWrapper struct {
-	base s3.HTTPClient
-}
-
-func (c *s3HTTPClientWrapper) Do(req *http.Request) (*http.Response, error) {
-	if captured, ok := req.Context().Value(unsignedHeadersContextKey{}).([]capturedHeaderEntry); ok {
-		for _, entry := range captured {
-			if len(req.Header.Values(entry.name)) == 0 {
-				for _, val := range entry.values {
-					req.Header.Add(entry.name, val)
-				}
+	// Values belong to this operation's stack; retry attempts run sequentially.
+	var values []string
+	if err := stack.Finalize.Insert(middleware.FinalizeMiddlewareFunc("RemoveGCSAcceptEncoding",
+		func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+			req, ok := in.Request.(*smithyhttp.Request)
+			if !ok {
+				return middleware.FinalizeOutput{}, middleware.Metadata{}, fmt.Errorf("GCS signing: unexpected request type %T", in.Request)
 			}
-		}
+			values = req.Header.Values("Accept-Encoding")
+			req.Header.Del("Accept-Encoding")
+			return next.HandleFinalize(ctx, in)
+		},
+	), "Signing", middleware.Before); err != nil {
+		return err
 	}
-	if c.base != nil {
-		return c.base.Do(req)
-	}
-	return http.DefaultClient.Do(req)
-}
-
-// withUnsignedHeaders configures the S3 client to keep specified headers out of SigV4 signatures
-// while ensuring stripped headers are still transmitted unsigned on the wire (including
-// Accept-Encoding: identity to prevent Go's HTTP transport from injecting gzip).
-func withUnsignedHeaders(headers ...string) func(*s3.Options) {
-	var normalized []string
-	seen := make(map[string]bool)
-	for _, h := range headers {
-		trimmed := strings.TrimSpace(h)
-		if trimmed == "" {
-			continue
-		}
-		lower := strings.ToLower(trimmed)
-		if !seen[lower] {
-			seen[lower] = true
-			normalized = append(normalized, lower)
-		}
-	}
-	if len(normalized) == 0 {
-		return func(*s3.Options) {}
-	}
-	return func(o *s3.Options) {
-		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-			// Skip stacks that don't have a Signing step (e.g. anonymous requests).
-			if _, ok := stack.Finalize.Get("Signing"); !ok {
-				return nil
+	return stack.Finalize.Insert(middleware.FinalizeMiddlewareFunc("RestoreGCSAcceptEncoding",
+		func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+			req, ok := in.Request.(*smithyhttp.Request)
+			if !ok {
+				return middleware.FinalizeOutput{}, middleware.Metadata{}, fmt.Errorf("GCS signing: unexpected request type %T", in.Request)
 			}
-			return stack.Finalize.Insert(
-				middleware.FinalizeMiddlewareFunc("StripUnsignedHeaders",
-					func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
-						if req, ok := in.Request.(*smithyhttp.Request); ok {
-							var captured []capturedHeaderEntry
-							hasAcceptEncoding := false
-							for _, h := range normalized {
-								if strings.EqualFold(h, "accept-encoding") {
-									hasAcceptEncoding = true
-								}
-								if vals := req.Header.Values(h); len(vals) > 0 {
-									captured = append(captured, capturedHeaderEntry{name: h, values: vals})
-									req.Header.Del(h)
-								}
-							}
-							// If accept-encoding is unsigned and no explicit Accept-Encoding was on the request,
-							// ensure Accept-Encoding: identity is sent on the wire to prevent Go's http.Transport
-							// from injecting Accept-Encoding: gzip.
-							if hasAcceptEncoding {
-								hasExplicit := false
-								for _, entry := range captured {
-									if strings.EqualFold(entry.name, "accept-encoding") {
-										hasExplicit = true
-										break
-									}
-								}
-								if !hasExplicit {
-									captured = append(captured, capturedHeaderEntry{name: "Accept-Encoding", values: []string{"identity"}})
-								}
-							}
-							ctx = context.WithValue(ctx, unsignedHeadersContextKey{}, captured)
-						}
-						return next.HandleFinalize(ctx, in)
-					},
-				),
-				"Signing",
-				middleware.Before,
-			)
-		})
-
-		o.HTTPClient = &s3HTTPClientWrapper{
-			base: o.HTTPClient,
-		}
-	}
+			if len(values) > 0 {
+				req.Header["Accept-Encoding"] = values
+			}
+			return next.HandleFinalize(ctx, in)
+		},
+	), "Signing", middleware.After)
 }
 
 // awsEndpointDomains are the parent domains AWS serves S3 from. VPC, dualstack

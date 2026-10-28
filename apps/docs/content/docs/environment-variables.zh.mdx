@@ -132,9 +132,10 @@ MULTICA_PUBLIC_URL=https://api.multica.example.com
 | `AWS_SECRET_ACCESS_KEY` | SDK 默认凭据链 | 静态 secret key |
 | `AWS_ENDPOINT_URL` | 空 | MinIO 等 S3 兼容 endpoint |
 | `S3_USE_PATH_STYLE` | 自定义 endpoint 时为 `true` | 是否使用 path-style 地址 |
-| `S3_UNSIGNED_HEADERS` | 空（Google Cloud Storage 时自动为 `accept-encoding`） | 从 SigV4 签名中排除的请求头列表（以逗号分隔，如用于兼容 GCS S3 XML API 的 `accept-encoding`）。注意：排除的请求头在传输过程中将不受 SigV4 完整性保护。 |
 | `ATTACHMENT_DOWNLOAD_MODE` | `auto` | `auto`、`cloudfront`、`presign` 或 `proxy` |
 | `ATTACHMENT_DOWNLOAD_URL_TTL` | `30m` | 签名下载地址的有效期 |
+
+当 `AWS_ENDPOINT_URL` 指向 Google Cloud Storage 时，会自动将 `Accept-Encoding` 排除在请求签名之外。
 
 内网 MinIO 等 endpoint 无法被浏览器直接访问时，使用 `ATTACHMENT_DOWNLOAD_MODE=proxy`。
 
